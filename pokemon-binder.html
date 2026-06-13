@@ -5942,8 +5942,6 @@ const ST = {
   awayMode: null,
   specialty: '',
   soundOn: true,
-  kioskPin: null,
-  kioskLocked: false,
   appTheme: 'system',
   currentShow: null,
   shows: [],
@@ -7469,7 +7467,7 @@ function renderCustomerRequests(){
   const allCards=ST.binders.flatMap(b=>b.cards);
   const blocks=[];
   // Only THIS shopper's offer renders as theirs — pendingOffer may belong
-  // to another shopper on a shared/kiosk device, and the old panel offered
+  // to another shopper on a shared device, and the old panel offered
   // a Cancel button for a deal that wasn't theirs to cancel.
   const _offerIsMine=pendingOffer&&pendingOffer.cp?.username&&pendingOffer.cp.username===ST.cp?.username;
   if(pendingOffer&&_offerIsMine){
@@ -7645,10 +7643,6 @@ function applyPortalVisibility(){
   document.body.setAttribute('data-portal',portal);
 }
 function switchPortal(p){
-  // Defense in depth for kiosk mode: even if some path reaches this while
-  // locked (the portal toggle is hidden, but deep links / future buttons
-  // might not be), leaving shopper view requires the PIN.
-  if(ST.kioskLocked&&p!=='customer'){unlockKiosk();return;}
   ST.activePortal=p;
   applyPortalVisibility();
   go(p==='vendor'?'vendor':'customer');
@@ -7688,11 +7682,9 @@ function openPortalMenu(){
     <div style="font-size:12px;color:var(--color-text-secondary)">Vendors and customers normally use separate devices. You can switch between them here to try both.</div>
     <button class="btn ${cur==='vendor'?'pu':''}" id="pm-vendor" style="display:flex;align-items:center;gap:10px;justify-content:flex-start;text-align:left;padding:12px"><i class="ti ti-briefcase" style="font-size:20px"></i><div><div style="font-size:13px;font-weight:500">Seller view</div><div style="font-size:11px;opacity:.8">${ST.vp.name} · Manage binders, prices, sales</div></div>${cur==='vendor'?'<i class="ti ti-check" style="margin-left:auto"></i>':''}</button>
     <button class="btn ${cur==='customer'?'gr':''}" id="pm-customer" style="display:flex;align-items:center;gap:10px;justify-content:flex-start;text-align:left;padding:12px;${cur==='customer'?'background:var(--gr);color:#fff;border-color:var(--gr)':''}"><i class="ti ti-device-mobile" style="font-size:20px"></i><div><div style="font-size:13px;font-weight:500">Shopper view</div><div style="font-size:11px;opacity:.8">${ST.cp.name} · Browse vendors, send offers</div></div>${cur==='customer'?'<i class="ti ti-check" style="margin-left:auto"></i>':''}</button>
-    <button class="btn" id="pm-kiosk" style="display:flex;align-items:center;gap:10px;justify-content:flex-start;text-align:left;padding:12px"><i class="ti ti-lock" style="font-size:20px;color:var(--am)"></i><div><div style="font-size:13px;font-weight:500">Hand to a shopper (kiosk lock)</div><div style="font-size:11px;opacity:.8">Locks the app in Shopper view — your PIN gets it back</div></div></button>
     <button class="btn" onclick="closeModal()">Cancel</button>`);
   document.getElementById('pm-vendor').addEventListener('click',()=>{closeModal();switchPortal('vendor');});
   document.getElementById('pm-customer').addEventListener('click',()=>{closeModal();switchPortal('customer');});
-  document.getElementById('pm-kiosk').addEventListener('click',()=>{closeModal();lockKiosk();});
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -8377,6 +8369,7 @@ function openAddCard(targetSlot){
   // Reset graded/raw toggle to Raw (default condition NM)
   const num=document.getElementById('f-grade-num');if(num)_populateGradeNumSelect(num,'10');
   const co=document.getElementById('f-grade-co');if(co)co.value='PSA';
+  const cert=document.getElementById('f-cert');if(cert)cert.value='';
   // Reset subgrade UI so a previous-session toggle doesn't carry over.
   const sgOn=document.getElementById('f-subgrade-on');if(sgOn)sgOn.checked=false;
   const sgFields=document.getElementById('f-subgrade-fields');if(sgFields)sgFields.style.display='none';
@@ -9087,6 +9080,10 @@ async function loadSetsCache(forceRefresh){
           series:s.series,symbol:s.images?.symbol,total:s.total,raw:s
         };
         const al=new Set([obj.displayLower,obj.nameLower].filter(Boolean));
+        // Accent-folded variants — the alias regex is accent-sensitive, so
+        // "Pokémon Rumble" must ALSO be indexed as "pokemon rumble" or a user
+        // typing without the é can never hit the set.
+        [...al].forEach(a=>{const f=a.normalize('NFD').replace(/[̀-ͯ]/g,'');if(f!==a)al.add(f);});
         if(obj.id==='base1')al.add('base set');
         if(obj.id==='sv3pt5')al.add('151');
         obj.aliases=Array.from(al);
@@ -9430,7 +9427,20 @@ function parseSearchInput(raw){
       const suffixMatches=allowSuffix?sets.filter(s=>s.aliases.some(a=>
         a.endsWith(' '+fragment)||a.endsWith('-'+fragment)
       )):[];
-      const matches=prefixMatches.length?prefixMatches:suffixMatches;
+      // Word-level fallback (single trailing token only): the fragment appears
+      // as a whole WORD inside a set name ("rumble" → Pokémon Rumble) that the
+      // curated suffix vocab doesn't know. Unlike vocab words we never gamble
+      // on which reading the user meant — buildApiQuery emits
+      // (name:frag* OR set.name:frag*) so card-name and set-name readings both
+      // come back in one query ("surfing pikachu" keeps its name results even
+      // though "Detective Pikachu" is a set; "ninetales rumble" finds ru1).
+      let wordMatches=[];
+      if(!prefixMatches.length&&!suffixMatches.length&&take===1&&tokensBefore.length>=1&&fragment.length>=4){
+        wordMatches=sets.filter(s=>s.aliases.some(a=>(' '+a.replace(/-/g,' ')+' ').includes(' '+fragment+' ')));
+        if(wordMatches.length>8)wordMatches=[]; // too common a word to mean a set
+      }
+      const isWordMatch=!prefixMatches.length&&!suffixMatches.length&&wordMatches.length>0;
+      const matches=prefixMatches.length?prefixMatches:(suffixMatches.length?suffixMatches:wordMatches);
       if(matches.length){
         matches.sort((x,y)=>{
           const xd=Date.parse(x.raw?.releaseDate||'')||0;
@@ -9442,11 +9452,15 @@ function parseSearchInput(raw){
         });
         fuzzyCandidates={fragment,take,remainingName:tokens.slice(0,-take).join(' ')||null,sets:matches};
         // AUTO-APPLY rules:
+        //  • Word matches never auto-apply — the fragment could equally be part
+        //    of the card name, so the query carries BOTH readings instead.
         //  • Single match → unambiguous, apply.
         //  • Multiple matches but top vs OLDEST has >5yr gap → user almost certainly means
         //    the modern set ("Pikachu hidden" → Hidden Fates 2019, not Hidden Legends 2004).
         //  • Otherwise → leave as suggestion chips so the user picks the right era.
-        if(matches.length===1){
+        if(isWordMatch){
+          fuzzyCandidates.wordMatch=true;
+        } else if(matches.length===1){
           setOut=matches[0];fuzzyCandidates.autoApplied=true;
         } else if(matches.length>=2){
           const top=Date.parse(matches[0].raw?.releaseDate||'')||0;
@@ -9596,6 +9610,16 @@ function buildApiQuery(parsed){
       parts.push('set.name:'+safe+'*');
     }
   }
+  // Word-match fragment — the trailing token matched a whole WORD inside a
+  // set name ("ninetales rumble" → Pokémon Rumble) but could equally be part
+  // of the card name ("surfing pikachu" vs the Detective Pikachu set). Emit
+  // BOTH readings in one query: the set.name field is tokenized by the API,
+  // so set.name:rumble* matches "Pokémon Rumble" (verified live).
+  else if(parsed.fuzzyCandidates?.wordMatch&&parsed.fuzzyCandidates.fragment){
+    const f=parsed.fuzzyCandidates.fragment.replace(/["\\]/g,'');
+    const safeF=/['\-.]/.test(f)?'"'+f.replace(/'/g,"\\'")+'*"':f+'*';
+    parts.push('(name:'+safeF+' OR set.name:'+safeF+')');
+  }
   if(parsed.rarity){
     // Quote rarity since values like "Rare Holo Star" contain spaces.
     parts.push('rarity:"'+parsed.rarity+'"');
@@ -9641,6 +9665,13 @@ async function runSearchRegression(){
     // Plain numeric behavior unchanged
     {q:'Charizard 4',       ok:p=>p.number==='4'},
     {q:'Charizard 215/203', ok:p=>p.number==='215'},
+    // Niche-set word matching (bug: "ninetales rumble" returned nothing —
+    // "rumble" is an interior word of "Pokémon Rumble", not a prefix)
+    {q:'ninetales rumble',  ok:p=>p.fuzzyCandidates?.wordMatch&&p.fuzzyCandidates.sets.some(s=>s.id==='ru1')},
+    // Accent folding — full set name typed without the é must match the alias
+    {q:'ninetales pokemon rumble', ok:p=>p.set?.id==='ru1'},
+    // Guard rail — a name word that is also a set word must keep its name reading
+    {q:'surfing pikachu',   ok:p=>!p.set&&(!p.fuzzyCandidates||!p.fuzzyCandidates.autoApplied)},
   ];
   let pass=0,fail=0;
   for(const c of cases){
@@ -13462,7 +13493,9 @@ function invNewActive(){
 // Update the tab count badges (called whenever inventory counts change)
 function refreshInventoryTabCounts(){
   const bCount=(ST.binders||[]).length;
-  const cCount=(ST.cases||[]).reduce((n,c)=>n+(c.cards||[]).filter(x=>!x.sold&&!x.removed).length,0);
+  // Cases badge counts CASES (containers), not the cards inside them — mirrors
+  // the Binders badge which counts binders, not pockets.
+  const cCount=(ST.cases||[]).length;
   const sCount=(ST.shelfItems||[]).filter(x=>!x.removed).length;
   const setText=(id,n)=>{const el=document.getElementById(id);if(el)el.textContent=n>0?String(n):'';};
   setText('inv-tab-count-binders',bCount);
@@ -15435,9 +15468,33 @@ function renderShelfGrid(){
     sub:cs.descriptor||'',
     custom:cs,
   }));
-  const cats=[...catDefs,...customShelves];
+  // Built-in shelves can be cosmetically overridden (rename + restyle) and
+  // hidden when empty — both stored in ST. Overrides merge over the raw def;
+  // hidden defaults drop out UNLESS they currently hold items, in which case
+  // they auto-restore (and we prune the stale hidden entry so the un-hide
+  // sticks). Mirrors the "hide if empty, block if not" delete behavior.
+  const _shOverrides=ST.shelfDefaults||{};
+  const _shHidden=ST.hiddenShelves||[];
+  let _shRestored=false;
+  const visibleDefaults=catDefs.filter(c=>{
+    if(!_shHidden.includes(c.id))return true;
+    const count=items.filter(it=>it.type===c.id).length;
+    if(count>0){
+      ST.hiddenShelves=(ST.hiddenShelves||[]).filter(x=>x!==c.id);
+      _shRestored=true;
+      return true;
+    }
+    return false;
+  }).map(c=>{
+    const ov=_shOverrides[c.id];
+    if(!ov)return c;
+    return {...c, label:ov.title||c.label, sub:(ov.descriptor!=null?ov.descriptor:c.sub), ov};
+  });
+  if(_shRestored)persistST();
+  const cats=[...visibleDefaults,...customShelves];
   // Per-tile graphic. Defaults use the existing .shelf-cat-item.<type>
-  // classes; custom shelves render an image OR an icon plaque.
+  // classes UNLESS the vendor set a photo/icon override; custom shelves
+  // render an image OR an icon plaque.
   const tileGraphic=(c)=>{
     if(c.custom){
       if(c.custom.image){
@@ -15447,17 +15504,28 @@ function renderShelfGrid(){
       const accent=c.custom.accent||'#7C3AED';
       return `<div class="shelf-cat-item cshelf-icon" style="--cshelf-accent:${accent}"><i class="ti ${escH(icon)}"></i></div>`;
     }
+    // Default with a cosmetic override (photo > icon > illustrated graphic).
+    if(c.ov){
+      if(c.ov.image){
+        return `<div class="shelf-cat-item cshelf-photo" style="background-image:url('${c.ov.image}')"></div>`;
+      }
+      if(c.ov.icon){
+        return `<div class="shelf-cat-item cshelf-icon" style="--cshelf-accent:${c.ov.accent||'#7C3AED'}"><i class="ti ${escH(c.ov.icon)}"></i></div>`;
+      }
+    }
     return `<div class="shelf-cat-item ${c.graphic}"></div>`;
   };
   const tiles=cats.map(c=>{
     const count=items.filter(it=>it.type===c.id).length;
-    // Custom shelves get edit + delete hover pills, mirroring the binder and
-    // case tile pattern. The four default categories are built-in types
-    // (add flows + the product DB reference them) so they stay pill-free.
+    // Edit + delete hover pills on EVERY shelf — defaults and custom alike —
+    // matching the binder and case tile pattern. Custom shelves route to the
+    // custom editor / delete (reparents to Art); defaults route to the
+    // default editor / hide-when-empty flow.
     const pills=c.custom
       ?`<button class="cshelf-edit-pill btn sm pu" data-cshelf-edit="${c.custom.id}" title="Edit shelf"><i class="ti ti-edit"></i></button>
         <button class="cshelf-del-pill btn sm re" data-cshelf-del="${c.custom.id}" title="Delete shelf"><i class="ti ti-trash"></i></button>`
-      :'';
+      :`<button class="cshelf-edit-pill btn sm pu" data-shelf-def-edit="${c.id}" title="Edit shelf"><i class="ti ti-edit"></i></button>
+        <button class="cshelf-del-pill btn sm re" data-shelf-def-del="${c.id}" title="Hide shelf"><i class="ti ti-trash"></i></button>`;
     return `<div class="shelf-cat-card" data-shelf-open="${c.id}">
       ${pills}
       <div class="shelf-cat-graphic">
@@ -15478,19 +15546,21 @@ function renderShelfGrid(){
   host.querySelectorAll('[data-shelf-open]').forEach(el=>{
     el.addEventListener('click',()=>{_openShelfCategory=el.dataset.shelfOpen;renderShelfGrid();});
   });
-  // Edit pill → the same shelf editor the detail-view settings cog opens.
+  // Custom-shelf edit pill → the editor the detail-view settings cog opens.
   host.querySelectorAll('[data-cshelf-edit]').forEach(btn=>{
-    btn.addEventListener('click',e=>{
-      e.stopPropagation();
-      openEditShelf(btn.dataset.cshelfEdit);
-    });
+    btn.addEventListener('click',e=>{e.stopPropagation();openEditShelf(btn.dataset.cshelfEdit);});
   });
-  // Delete pill → shared confirm-and-delete flow (reparents items to Art).
+  // Custom-shelf delete pill → confirm-and-delete (reparents items to Art).
   host.querySelectorAll('[data-cshelf-del]').forEach(btn=>{
-    btn.addEventListener('click',e=>{
-      e.stopPropagation();
-      deleteCustomShelf(btn.dataset.cshelfDel);
-    });
+    btn.addEventListener('click',e=>{e.stopPropagation();deleteCustomShelf(btn.dataset.cshelfDel);});
+  });
+  // Default-shelf edit pill → rename / restyle the built-in category.
+  host.querySelectorAll('[data-shelf-def-edit]').forEach(btn=>{
+    btn.addEventListener('click',e=>{e.stopPropagation();openEditDefaultShelf(btn.dataset.shelfDefEdit);});
+  });
+  // Default-shelf delete pill → hide when empty, block when it still has items.
+  host.querySelectorAll('[data-shelf-def-del]').forEach(btn=>{
+    btn.addEventListener('click',e=>{e.stopPropagation();deleteDefaultShelf(btn.dataset.shelfDefDel);});
   });
 }
 
@@ -15787,6 +15857,68 @@ function deleteCustomShelf(shelfId){
   persistST();
   renderShelfGrid();refreshInventoryTabCounts();
   notify(`Deleted "${cs.title}"`);
+  return true;
+}
+
+// Raw labels/descriptors for the four built-in shelves — referenced by the
+// default-shelf edit + hide flows for the editor draft and confirm/notify copy.
+const SHELF_DEFAULT_META={
+  sealed:   {label:'Sealed',      sub:'Booster boxes, ETBs, packs'},
+  accessory:{label:'Accessories', sub:'Sleeves, toploaders, binders'},
+  mystery:  {label:'Mystery',     sub:'Mystery packs, mystery boxes'},
+  custom:   {label:'Art',         sub:'Playmats, prints, originals'},
+};
+
+// Edit a built-in shelf: rename + restyle (icon / accent / photo). Overrides
+// are cosmetic only — the underlying type id ('sealed'/'custom'/etc.) stays
+// fixed so every add-flow + the product DB keep working. Reuses the same
+// editor modal as custom shelves; stores the result in ST.shelfDefaults.
+function openEditDefaultShelf(catId){
+  const meta=SHELF_DEFAULT_META[catId];
+  if(!meta){notify('Unknown shelf');return;}
+  const ov=(ST.shelfDefaults||{})[catId]||{};
+  const draft={
+    title:ov.title||meta.label,
+    descriptor:ov.descriptor!=null?ov.descriptor:meta.sub,
+    icon:ov.icon||null,          // null = keep the illustrated default graphic
+    image:ov.image||null,
+    accent:ov.accent||CUSTOM_SHELF_ACCENTS[0],
+  };
+  _renderShelfEditorModal('Edit shelf',draft,(d)=>{
+    ST.shelfDefaults=ST.shelfDefaults||{};
+    ST.shelfDefaults[catId]={
+      title:d.title,
+      descriptor:d.descriptor,
+      icon:d.image?null:d.icon,  // photo wins; clear icon when a photo is set
+      image:d.image,
+      accent:d.accent,
+    };
+    persistST();closeModal();
+    _openShelfCategory=null;renderShelfGrid();refreshInventoryTabCounts();
+    notify(`Saved "${d.title}"`);
+  });
+}
+
+// Hide a built-in shelf — but only when it's EMPTY. If it still holds items
+// the hide is blocked (sealed products etc. have no fallback category the way
+// custom shelves reparent to Art). Hidden shelves auto-restore when an item
+// of that type is added again (see renderShelfGrid). Returns true if hidden.
+function deleteDefaultShelf(catId){
+  const meta=SHELF_DEFAULT_META[catId];
+  if(!meta)return false;
+  const label=((ST.shelfDefaults||{})[catId]||{}).title||meta.label;
+  const count=(ST.shelfItems||[]).filter(it=>!it.removed&&it.type===catId).length;
+  if(count>0){
+    notify(`"${label}" still has ${count} item${count!==1?'s':''} — sell or remove them before hiding this shelf.`);
+    return false;
+  }
+  if(!confirm(`Hide the "${label}" shelf? It reappears automatically if you add a matching item later.`))return false;
+  ST.hiddenShelves=ST.hiddenShelves||[];
+  if(!ST.hiddenShelves.includes(catId))ST.hiddenShelves.push(catId);
+  if(_openShelfCategory===catId)_openShelfCategory=null;
+  persistST();
+  renderShelfGrid();refreshInventoryTabCounts();
+  notify(`Hid "${label}"`);
   return true;
 }
 
@@ -16271,7 +16403,7 @@ function openShelfItemDetail(itemId){
     else notify(item.soldOut?`Sold last one of ${item.name} — marked sold out`:`Sold one ${item.name} (${item.quantity} left)`);
   });
   // In-app dialogs instead of native prompt()/confirm() — natives look
-  // foreign, block the thread, and can be suppressed in kiosk/fullscreen.
+  // foreign, block the thread, and can be suppressed in fullscreen mode.
   document.getElementById('si-restock')?.addEventListener('click',()=>{
     showModal(`<div style="font-size:15px;font-weight:500"><i class="ti ti-package" style="color:var(--pu);margin-right:6px"></i>Restock ${escH(item.name)}</div>
       <div style="font-size:11px;color:var(--color-text-secondary)">${item.quantity||0} in stock now — how many are you adding?</div>
@@ -17078,9 +17210,13 @@ function openShopperShelfItemDetail(itemId){
 // vendor has zero cases + zero shelf items, the tabs stay hidden entirely so
 // the shopper sees the original "Choose a binder" layout.
 function refreshShopperInventoryTabs(){
-  // Private cases are invisible to shoppers — their cards must not count
-  // toward the tab badge either (a "Cases (2)" tab over an empty grid).
-  const cCount=(ST.cases||[]).filter(c=>!c.private).reduce((n,c)=>n+(c.cards||[]).filter(x=>!x.sold&&!x.removed).length,0);
+  // Cases badge counts the CASES a shopper can actually browse — non-private
+  // cases that hold at least one sellable card — not the total cards inside
+  // (mirrors the vendor Cases badge counting cases, and the Binders badge
+  // counting binders). A non-private case with no sellable cards is excluded
+  // so the tab-visibility logic below (cCount>0) still hides an empty Cases
+  // tab exactly as before — sellable cards exist iff a browseable case exists.
+  const cCount=(ST.cases||[]).filter(c=>!c.private&&(c.cards||[]).some(x=>!x.sold&&!x.removed)).length;
   const sCount=(ST.shelfItems||[]).filter(x=>!x.removed).length;
   const bCount=(ST.binders||[]).filter(b=>!b.private).length;
   const setText=(id,n)=>{const el=document.getElementById(id);if(el)el.textContent=n>0?String(n):'';};
@@ -17520,7 +17656,7 @@ const STATIC_CARD_SETS=[
   // These 25 fill every missing number (175-225 range; the set's final card
   // is #225, plus one unnumbered jumbo not listed here).
   // Source: https://bulbapedia.bulbagarden.net/wiki/SVP_Black_Star_Promos_(TCG)
-  {id:'svp-gapfill',name:'Scarlet & Violet Black Star Promos',lang:'en',year:2023,cards:[
+  {id:'svp-gapfill',name:'Scarlet & Violet Black Star Promos',lang:'en',year:2023,ptcgioCdn:'svp',cards:[
     ['175','Espeon','P'],['176','Umbreon','P'],
     ['190','Pikachu','P'],['191','Sprigatito','P'],['192','Fuecoco','P'],
     ["204","Cynthia's Garchomp ex",'P'],["205","Team Rocket's Mewtwo ex",'P'],
@@ -17538,12 +17674,15 @@ const STATIC_CARD_SETS=[
   // revealed) and are intentionally omitted — never fabricate names.
   // Source: https://bulbapedia.bulbagarden.net/wiki/MEP_Black_Star_Promos_(TCG)
   //
-  // tcgdexPath: TCGdex carries this set (api.tcgdex.net id 'mep') but has
-  // not uploaded card scans yet (checked June 2026 — card records exist,
-  // image fields absent). pickStaticCard probes the deterministic asset URL
-  // (assets.tcgdex.net/en/me/mep/NNN/low.png) at pick time and uses the art
-  // the moment TCGdex publishes it — zero code changes needed later.
-  {id:'mep-promos',name:'Mega Evolution Black Star Promos',lang:'en',year:2025,tcgdexPath:'en/me/mep',cards:[
+  // Art sources (pickStaticCard probes each at pick time, in order):
+  //   1. ptcgioCdn 'mep' → images.pokemontcg.io/mep/NNN.png. The pokemontcg.io
+  //      *image CDN* hosts these scans even though the structured API returns
+  //      zero cards for set.id:mep — verified live serving 640px art. This is
+  //      the working source today.
+  //   2. tcgdexPath → assets.tcgdex.net/en/me/mep/NNN/low.png. TCGdex carries
+  //      the card records but had not uploaded scans (checked June 2026);
+  //      kept as a secondary that auto-heals if/when they publish.
+  {id:'mep-promos',name:'Mega Evolution Black Star Promos',lang:'en',year:2025,ptcgioCdn:'mep',tcgdexPath:'en/me/mep',cards:[
     ['1','Meganium','P'],['2','Inteleon','P'],['3','Alakazam','P'],['4','Lunatone','P'],
     ['5','Drifloon','P'],['6','Drifblim','P'],['7','Psyduck','P'],['8','Golduck','P'],
     ['9','Alakazam','P'],['10','Riolu','P'],['11','Mega Latias ex','P'],['12','Mega Lucario ex','P'],
@@ -17571,7 +17710,7 @@ const STATIC_CARD_SETS=[
   // SWSH Black Star Promos — the API never ingested the Crown Zenith-era
   // run (#251-307) or #75 Special Delivery Charizard. 57 cards.
   // Source: https://bulbapedia.bulbagarden.net/wiki/SWSH_Black_Star_Promos_(TCG)
-  {id:'swshp-gapfill',name:'SWSH Black Star Promos',lang:'en',year:2022,cards:[
+  {id:'swshp-gapfill',name:'SWSH Black Star Promos',lang:'en',year:2022,ptcgioCdn:'swshp',cards:[
     ['75','Special Delivery Charizard','P'],
     ["251","Boss's Orders (Cyrus)",'P'],
     ['253','Origin Forme Palkia V','P'],['254','Origin Forme Palkia VSTAR','P'],
@@ -17612,11 +17751,12 @@ const STATIC_CARD_SETS=[
     ['13','Eevee','P'],['14','Rayquaza','P'],['15','Drampa','P']
   ]},
   // Pokémon Rumble (standalone promo set, EN Dec 2009 / JA Jul 2009). 16 cards
-  // tied to the WiiWare Pokémon Rumble game, all printed Rare Holo. Missing
-  // from the Pokemon TCG API as a discrete set, so added here as gap-fill so
-  // a search for "rumble" / "pokemon rumble" / "Ninetales rumble" resolves.
+  // tied to the WiiWare Pokémon Rumble game, all printed Rare Holo. The set
+  // IS in the Pokemon TCG API as id 'ru1' (an earlier comment here claimed
+  // otherwise) — using the real id means picks get real apiIds (ru1-3) and
+  // the art probe below finds images.pokemontcg.io/ru1/N.png automatically.
   // Source: https://bulbapedia.bulbagarden.net/wiki/Pok%C3%A9mon_Rumble_(TCG)
-  {id:'pokemon-rumble',name:'Pokémon Rumble',nameLocal:'乱戦！ポケモンスクランブル×ポケモンカードゲーム',lang:'en',year:2009,cards:[
+  {id:'ru1',name:'Pokémon Rumble',nameLocal:'乱戦！ポケモンスクランブル×ポケモンカードゲーム',lang:'en',year:2009,ptcgioCdn:'ru1',cards:[
     ['1','Venusaur','H'],['2','Cherrim','H'],['3','Ninetales','H'],['4','Heatran','H'],
     ['5','Starmie','H'],['6','Gyarados','H'],['7','Pikachu','H'],['8','Zapdos','H'],
     ['9','Mewtwo','H'],['10','Mew','H'],['11','Diglett','H'],['12','Lucario','H'],
@@ -18102,8 +18242,23 @@ function renderStaticCardRow(card,set,variant){
   const displaySet=gap?gap.set:set.name;
   const d=document.createElement('div');d.className='sitem';
   const thumb=document.createElement('div');
-  thumb.style.cssText='width:26px;height:36px;border-radius:3px;background:var(--pul);flex-shrink:0;display:flex;align-items:center;justify-content:center;color:var(--pu);font-size:9px;font-weight:600';
+  thumb.style.cssText='width:26px;height:36px;border-radius:3px;background:var(--pul);flex-shrink:0;display:flex;align-items:center;justify-content:center;color:var(--pu);font-size:9px;font-weight:600;overflow:hidden';
   thumb.textContent=set.lang==='ja'?'JA':'EN';
+  // Art thumbnail — same deterministic sources pickStaticCard probes
+  // (ptcgioCdn → images.pokemontcg.io, tcgdexPath → assets.tcgdex.net). The
+  // image is only swapped in on successful load, so sets without published
+  // scans keep the EN/JA placeholder and never flash a broken image.
+  const _rowArt=set.ptcgioCdn
+    ?`https://images.pokemontcg.io/${set.ptcgioCdn}/${String(num).replace(/^0+(?=\d)/,'')}.png`
+    :(set.tcgdexPath?`https://assets.tcgdex.net/${set.tcgdexPath}/${String(num).match(/^\d+$/)?String(num).padStart(3,'0'):String(num)}/low.png`:null);
+  if(_rowArt){
+    // NOTE: no loading='lazy' here — the img stays DETACHED until onload
+    // swaps it in, and lazy images never load while detached (chicken-and-egg).
+    const im=document.createElement('img');
+    im.style.cssText='width:100%;height:100%;object-fit:cover';
+    im.onload=()=>{thumb.textContent='';thumb.appendChild(im);};
+    im.src=_rowArt;
+  }
   const info=document.createElement('div');info.style.cssText='min-width:0;flex:1';
   const langBadge=set.lang==='ja'
     ?'<span style="background:#FCEBEB;color:#A32D2D;padding:1px 4px;border-radius:6px;font-size:9px;margin-left:4px">JA</span>'
@@ -18148,35 +18303,98 @@ function pickStaticCard(card,set,variant){
   const printSuffix=variant&&variant!=='Unlimited'?' · '+variant:'';
   const setLine=`${realSet} #${num}${printSuffix}`+(set.lang==='ja'?' · 🇯🇵 JA':'');
   document.getElementById('prev-set').textContent=setLine;
-  // Sets that declare a tcgdexPath have deterministic art URLs on the
-  // TCGdex assets CDN even when no API carries images yet. Probe the low-res
-  // asset: if it loads, attach the art to the picked card + preview; if it
-  // 404s (scans not uploaded yet), leave the nulls so no dead URL is ever
-  // persisted onto an inventory card. The same pick auto-heals once TCGdex
-  // publishes scans — no code change needed.
+  // Static-index entries carry no art of their own, but the picture often
+  // lives on a deterministic CDN even when the structured API doesn't index
+  // the set. Build the candidate sources in priority order and probe each
+  // until one actually loads:
+  //   • ptcgioCdn → images.pokemontcg.io/{id}/{num}.png (+ _hires). The
+  //     pokemontcg.io image CDN serves the Black Star Promo scans the API
+  //     itself omits — the working source for those promos today.
+  //   • tcgdexPath → assets.tcgdex.net/{path}/{NNN}/low.png (+ high). The
+  //     secondary; auto-heals when TCGdex publishes scans.
+  // We probe the STANDARD-res url (most likely to exist) and store it as the
+  // explicit fallback (imgApi) while using the hi-res for the main img, so
+  // even a missing hi-res recovers to a verified url. Nothing is persisted
+  // until a probe succeeds — no dead URL ever lands on an inventory card.
+  const _artSources=[];
+  if(set.ptcgioCdn){
+    const n=String(num).replace(/^0+(?=\d)/,''); // pokemontcg.io CDN uses unpadded numbers
+    const b=`https://images.pokemontcg.io/${set.ptcgioCdn}/${n}`;
+    _artSources.push({probe:`${b}.png`,small:`${b}.png`,large:`${b}_hires.png`,api:`${b}.png`});
+  }
   if(set.tcgdexPath){
     const pad=String(num).match(/^\d+$/)?String(num).padStart(3,'0'):String(num);
-    const base=`https://assets.tcgdex.net/${set.tcgdexPath}/${pad}`;
-    const probe=new Image();
-    probe.onload=()=>{
-      // User may have picked a different card while the probe was in flight —
-      // only attach if this pick is still the active one.
-      if(!pickedCard||pickedCard.apiId!==set.id+'-'+num)return;
-      pickedCard.imgSmall=base+'/low.png';
-      pickedCard.imgLarge=base+'/high.png';
-      const artNow=document.getElementById('prev-art');
-      if(artNow){
-        artNow.innerHTML='';
-        const img=document.createElement('img');
-        img.src=pickedCard.imgSmall;
-        img.style.cssText='width:100%;height:100%;object-fit:cover';
-        artNow.appendChild(img);
-      }
-    };
-    probe.src=base+'/low.png';
+    const b=`https://assets.tcgdex.net/${set.tcgdexPath}/${pad}`;
+    _artSources.push({probe:`${b}/low.png`,small:`${b}/low.png`,large:`${b}/high.png`,api:`${b}/low.png`});
   }
+  const _attachArt=(s)=>{
+    // User may have picked a different card while the probe was in flight —
+    // only attach if this pick is still the active one.
+    if(!pickedCard||pickedCard.apiId!==set.id+'-'+num)return;
+    pickedCard.imgSmall=s.small;
+    pickedCard.imgLarge=s.large;
+    pickedCard.imgApi=s.api;
+    const artNow=document.getElementById('prev-art');
+    if(artNow){
+      artNow.innerHTML='';
+      const img=document.createElement('img');
+      img.src=s.small;
+      img.style.cssText='width:100%;height:100%;object-fit:cover';
+      artNow.appendChild(img);
+    }
+  };
+  const _probeArt=(i)=>{
+    if(i>=_artSources.length)return;
+    const s=_artSources[i];
+    const probe=new Image();
+    probe.onload=()=>_attachArt(s);
+    probe.onerror=()=>_probeArt(i+1); // this source 404'd — try the next
+    probe.src=s.probe;
+  };
+  _probeArt(0);
 }
 
+// Self-healing art backfill for static-index promo cards (the Black Star
+// Promo gap-fills). pickStaticCard attaches CDN art at pick time, but that
+// probe is async — a card added in the split-second before it resolves, or
+// during a transient network blip, lands art-less. This walks binder + case
+// cards on boot and re-probes the pokemontcg.io CDN for any such card that's
+// still missing usable art. Idempotent: once a card has real art it stops
+// matching, so there's no repeated work; cards with genuinely no CDN art
+// just re-probe a cheap 404. Runs ungated so it also heals across reloads.
+function backfillStaticPromoArt(){
+  const cdnByPrefix={};
+  (typeof STATIC_CARD_SETS!=='undefined'?STATIC_CARD_SETS:[]).forEach(s=>{if(s.ptcgioCdn)cdnByPrefix[s.id+'-']=s.ptcgioCdn;});
+  const prefixes=Object.keys(cdnByPrefix);
+  if(!prefixes.length)return;
+  const cards=[...ST.binders.flatMap(b=>b.cards||[]),...(ST.cases||[]).flatMap(c=>c.cards||[])];
+  let pending=0,healed=0;
+  const finish=()=>{
+    if(!healed)return;
+    persistST();
+    try{if(editBinder&&typeof renderVBinder==='function')renderVBinder();}catch{}
+    try{if(typeof renderCaseShelf==='function')renderCaseShelf();}catch{}
+    try{if(typeof renderVendorHome==='function')renderVendorHome();}catch{}
+    notifyOnce(`Pulled artwork for ${healed} promo card${healed!==1?'s':''}`);
+  };
+  cards.forEach(c=>{
+    if(!c||typeof c.apiId!=='string')return;
+    const pfx=prefixes.find(p=>c.apiId.startsWith(p));
+    if(!pfx)return;
+    // Already has real art (and it's not the dead TCGdex fallback)? leave it.
+    if(c.img&&!/assets\.tcgdex\.net/.test(c.img))return;
+    const cdn=cdnByPrefix[pfx];
+    const num=String(c.num||c.apiId.slice(pfx.length)).replace(/^0+(?=\d)/,'');
+    if(!num)return;
+    const std=`https://images.pokemontcg.io/${cdn}/${num}.png`;
+    const hi=`https://images.pokemontcg.io/${cdn}/${num}_hires.png`;
+    pending++;
+    const probe=new Image();
+    probe.onload=()=>{c.img=hi;c.imgApi=std;healed++;if(--pending===0)finish();};
+    probe.onerror=()=>{if(--pending===0)finish();};
+    probe.src=std;
+  });
+}
 // Append a "From our static index" section to a search dropdown. Multi-variant
 // sets (Japanese 1st-Ed era, etc.) emit one row per variant so the user can pick
 // 1st Edition vs Unlimited at the search level — same pattern WOTC sets use.
@@ -18185,7 +18403,7 @@ function appendStaticIndexResults(query,drop,langFilter){
   if(!matches.length)return;
   const head=document.createElement('div');
   head.style.cssText='padding:6px 8px;font-size:10px;color:var(--color-text-secondary);background:var(--color-background-secondary);border-top:0.5px solid var(--color-border-tertiary);border-bottom:0.5px solid var(--color-border-tertiary);display:flex;align-items:center;gap:4px';
-  head.innerHTML=`<i class="ti ti-database" style="color:var(--pu)"></i><strong style="color:var(--color-text-primary)">From our static index</strong> · promos &amp; older sets · partial coverage, no photos <span style="margin-left:auto">${matches.length} match${matches.length===1?'':'es'}</span>`;
+  head.innerHTML=`<i class="ti ti-database" style="color:var(--pu)"></i><strong style="color:var(--color-text-primary)">From our static index</strong> · promos &amp; older sets · partial coverage <span style="margin-left:auto">${matches.length} match${matches.length===1?'':'es'}</span>`;
   drop.appendChild(head);
   matches.forEach(m=>{
     // If the set declares variants (e.g. JP 1st-Ed era sets), emit one row per variant.
@@ -21579,6 +21797,8 @@ function setAddGradeMode(mode){
   const gradedRow=document.getElementById('f-graded-row');
   if(cond)cond.style.display=(mode==='graded')?'none':'';
   if(gradedRow)gradedRow.style.display=(mode==='graded')?'flex':'none';
+  const certRow=document.getElementById('f-cert-row');
+  if(certRow)certRow.style.display=(mode==='graded')?'flex':'none';
   document.querySelectorAll('#f-grade-toggle [data-grade-mode]').forEach(b=>{
     b.classList.toggle('pu',b.dataset.gradeMode===mode);
   });
@@ -21695,6 +21915,10 @@ function addCard(keepPick){
   const gradeCo=isGraded?document.getElementById('f-grade-co').value:null;
   const gradeNum=isGraded?document.getElementById('f-grade-num').value:null;
   const grade=isGraded?`${gradeCo} ${gradeNum}`:null;
+  // Cert number — only for graded slabs. Trimmed; empty becomes null. Same
+  // field name (card.cert) the edit modal and scanner use, so the buyer-side
+  // "View cert" button lights up for manually-added graded cards too.
+  const certClean=isGraded?(document.getElementById('f-cert')?.value||'').trim():'';
   // Subgrades — only collected for companies that support them and only when
   // the user has ticked the Subgrades checkbox.
   let subgrades=null;
@@ -21733,7 +21957,7 @@ function addCard(keepPick){
   }
   const newCardId=uid++;
   // Build the card record once; slot/casePosition differ by destination.
-  const cardObj={id:newCardId,name:pickedCard.name,nameEn:pickedCard.nameEn||null,set:pickedCard.set,setId:pickedCard.setId||null,num:pickedCard.num||null,cond,grade,gradeCompany:gradeCo,gradeNumber:gradeNum?parseFloat(gradeNum):null,subgrades,print,price,cost,addedAt:Date.now(),sold:false,img,imgApi:pickedCard.imgApi||null,imgSource,apiId:pickedCard.apiId||null,tcgUrl:pickedCard.tcgUrl||null,rarity:pickedCard.rarity||null,cardMod:pickedCard.cardMod||null,condPhoto:pickedCard.uploadedPhoto||null,backPhoto:pickedCard.uploadedBack||null,lang:pickedCard.lang||'en'};
+  const cardObj={id:newCardId,name:pickedCard.name,nameEn:pickedCard.nameEn||null,set:pickedCard.set,setId:pickedCard.setId||null,num:pickedCard.num||null,cond,grade,gradeCompany:gradeCo,gradeNumber:gradeNum?parseFloat(gradeNum):null,subgrades,cert:certClean||null,print,price,cost,addedAt:Date.now(),sold:false,img,imgApi:pickedCard.imgApi||null,imgSource,apiId:pickedCard.apiId||null,tcgUrl:pickedCard.tcgUrl||null,rarity:pickedCard.rarity||null,cardMod:pickedCard.cardMod||null,condPhoto:pickedCard.uploadedPhoto||null,backPhoto:pickedCard.uploadedBack||null,lang:pickedCard.lang||'en'};
   if(caseMode){
     // If the vendor tapped a specific `+` empty slot in the case interior,
     // _caseAddCtx.pendingSlot is the linear slot index — convert it to the
@@ -21764,6 +21988,9 @@ function addCard(keepPick){
   // Sticky defaults (#1) — remember last cond/print/cost across adds
   ST.lastAdd={cond:cond||'NM',print,cost:String(cost||'')};
   persistST();
+  // Always clear the cert field — every slab has its own unique cert, so even
+  // a "+1 more" copy must not inherit the previous card's number.
+  const _fcert=document.getElementById('f-cert');if(_fcert)_fcert.value='';
   if(keepPick){
     document.getElementById('f-price').value='';
     // keep cost since "+1 more like this" usually means same stack
@@ -23387,7 +23614,7 @@ function toggleCart(id){
   renderCBinder();
 }
 // Write the runtime cart through to ST.carts immediately. Without this the
-// cart only persisted on exitBinder(), so (a) a kiosk reload lost everything
+// cart only persisted on exitBinder(), so (a) a reload lost everything
 // added since entering the binder, and (b) removing a card didn't stick —
 // getAllCartIds() unions runtime cart with the stale ST.carts copy, which
 // resurrected the removed card in the badge/cart view/offer until exit.
@@ -26018,7 +26245,7 @@ const HELP_CONTENT = {
       {name:'Cash payments', what:'When a shopper picks Cash at checkout, you see a "Cash sale: $X" prompt with three options: confirm the full amount, accept a rounded number (if the total had cents), or cancel the deal.',
        steps:['When the prompt appears, count the cash.','Tap "Got $X" to confirm — the cards are marked sold and logged in your stats.','Tap "Got $X (round)" if the customer paid the rounded number instead of the exact total.','Tap "Cancel deal" if the customer changed their mind or the cash didn\'t arrive. The cards stay in your inventory and the customer is notified.']},
      ]},
-    {title:'Running Your Store', summary:'Tools for live shows — quick sales, tracking, kiosk mode.',
+    {title:'Running Your Store', summary:'Tools for live shows — quick sales, show tracking, and stepping away.',
      items:[
       {name:'Quick cash sale', what:'A customer hands you cash, or you sold something off-app. Quick sale works like a checkout — search your entire inventory (binders, cases, AND shelf items), tap to add it to the sale, then keep going for as many things as you sold.',
        steps:['On the Binders tab, tap the cash icon at the top (between the coffee icon and New binder).','Type a card name, set, or number in the search box.','Tap a result to add it to "In this sale".','Search and add more cards if you need to. Tap × on any card to remove it.','Type the total the customer paid.','Tap Mark sold.'],
@@ -26029,8 +26256,6 @@ const HELP_CONTENT = {
        steps:['Tap End show in the banner at the top of any tab.','Review the recap and tap Done.']},
       {name:'Step away', what:'Going to lunch? Set a back-by message so customers who scan your QR see it instead of your binders.',
        steps:['On the Binders tab, tap the coffee icon at the top.','Type when you\'ll be back (e.g. "Back at 2:15").','Tap to come back online when you return.']},
-      {name:'Kiosk mode (lock for customers)', what:'Hand your phone to a customer in Shopper view without worrying they\'ll wander into your dashboard.',
-       steps:['Switch to Shopper view in the bottom-left.','Set a 4-digit PIN the first time.','When you take the phone back, enter the PIN to unlock the Seller view.']},
       {name:'Read your stats', what:'The Stats tab shows revenue, profit, average days to sell, profit margin, and your most-popular cards. Cards with no cost data count toward revenue but are excluded from profit and margin so the numbers stay honest.',
        steps:['Tap Stats at the bottom.','Sort by recent, highest profit, lowest profit, or current show.'],
        tip:'A "(N no-cost)" footnote on the profit and margin cards tells you how many sales were excluded. Per-sale rows for those cards show "No cost data" instead of a profit pill, and the last-7 chart shows them as neutral grey bars.'},
@@ -26724,67 +26949,6 @@ function flyToCart(fromEl){
     ghost.style.opacity='0';
   });
   setTimeout(()=>ghost.remove(),600);
-}
-
-// ══════════════════════════════════════════════════════════════
-// KIOSK LOCK MODE
-// ══════════════════════════════════════════════════════════════
-function lockKiosk(){
-  if(!ST.kioskPin){
-    showModal(`<div style="font-size:15px;font-weight:500"><i class="ti ti-lock" style="color:var(--pu);margin-right:6px"></i>Set a shopper-mode PIN</div>
-      <div style="font-size:12px;color:var(--color-text-secondary)">Choose a 4-digit PIN. You'll use this to unlock the seller view when you take the phone back.</div>
-      <input id="kp-set" type="tel" maxlength="4" placeholder="• • • •" style="text-align:center;letter-spacing:8px;font-size:18px"/>
-      <div style="display:flex;gap:6px"><button class="btn" style="flex:1" onclick="closeModal()">Cancel</button><button class="btn pu" style="flex:1" id="kp-set-btn">Lock & hand off</button></div>`);
-    setTimeout(()=>document.getElementById('kp-set')?.focus(),50);
-    document.getElementById('kp-set-btn').addEventListener('click',()=>{
-      const v=document.getElementById('kp-set').value.trim();
-      if(!/^\d{4}$/.test(v)){notify('Your PIN should be 4 numbers');return;}
-      ST.kioskPin=v;ST.kioskLocked=true;closeModal();applyKioskLock();notify('Locked — hand the phone to your customer');
-    });
-  } else {
-    ST.kioskLocked=true;applyKioskLock();notify('Locked — hand the phone to your customer');
-  }
-}
-function unlockKiosk(){
-  showModal(`<div style="font-size:15px;font-weight:500"><i class="ti ti-lock-open" style="color:var(--pu);margin-right:6px"></i>Your PIN</div>
-    <input id="kp-in" type="tel" maxlength="4" placeholder="• • • •" style="text-align:center;letter-spacing:8px;font-size:18px"/>
-    <div style="display:flex;gap:6px"><button class="btn" style="flex:1" onclick="closeModal()">Cancel</button><button class="btn pu" style="flex:1" id="kp-in-btn">Unlock</button></div>`);
-  setTimeout(()=>document.getElementById('kp-in')?.focus(),50);
-  document.getElementById('kp-in-btn').addEventListener('click',()=>{
-    if(document.getElementById('kp-in').value===ST.kioskPin){ST.kioskLocked=false;closeModal();applyKioskLock();notify('Seller view unlocked');}
-    else notify("That PIN didn't match — try again");
-  });
-}
-function applyKioskLock(){
-  const tabs=document.querySelectorAll('.tab-bar .tab');
-  if(ST.kioskLocked){
-    // Select by data-tab id, never by position — the portal toggle sits at
-    // index 0, so the old (i===1) check showed the shopper the VENDOR tab.
-    // A locked kiosk shows exactly what a shopper needs: Browse + Requests.
-    // Everything else (including the portal toggle) is hidden.
-    const allowed=new Set(['customer','requests']);
-    tabs.forEach(t=>{t.style.display=allowed.has(t.dataset.tab)?'':'none';});
-    go('customer');
-    let chip=document.getElementById('unlock-chip');
-    if(!chip){
-      chip=document.createElement('button');
-      chip.id='unlock-chip';chip.className='btn sm';
-      chip.style.cssText='position:fixed;top:8px;right:8px;z-index:60;background:rgba(255,255,255,.18);border-color:rgba(255,255,255,.35);color:#fff;padding:4px 8px;font-size:11px';
-      chip.innerHTML='<i class="ti ti-lock"></i> Vendor';
-      chip.onclick=unlockKiosk;
-      document.body.appendChild(chip);
-    }
-  } else {
-    // Unlocking doesn't mean "show everything" — restore the normal
-    // portal/plan-filtered tab bar. The portal toggle has no data-portals
-    // attribute (applyPortalVisibility skips it), so un-hide it explicitly.
-    applyPortalVisibility();
-    const tg=document.getElementById('portal-toggle');if(tg)tg.style.display='';
-    document.getElementById('unlock-chip')?.remove();
-    // Navigate back to the portal's home view — the lock left the shopper
-    // Browse view active, which the vendor tab bar doesn't even list.
-    go(ST.activePortal==='customer'?'customer':'vendor');
-  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -28242,6 +28406,10 @@ const _persist=fn=>function(...a){const r=fn.apply(this,a);persistST();return r;
   }
 })();
 loadST();
+// One-time cleanup: the kiosk-lock feature was removed. Drop its orphaned
+// persisted flags so a device that was locked when the feature went away
+// boots normally instead of carrying dead state forever.
+if('kioskLocked' in ST||'kioskPin' in ST){delete ST.kioskLocked;delete ST.kioskPin;}
 migrateSlots();
 reconcilePlanScans(); // grants plan-tier scans (Pro: 20, Vendor+: 100) on first load after upgrade
 validateState();
@@ -28250,16 +28418,11 @@ applyAppTheme();
 applyPortalVisibility();
 updatePortalBadges();
 // Land in the portal the device was actually in — the static HTML defaults
-// to the vendor view, so without this a kiosk tablet in shopper mode
+// to the vendor view, so without this a device left in shopper mode
 // reloads into the vendor dashboard (under a shopper tab bar) until a tab
 // is tapped. go() activates the right tab + view and renders it.
 go(ST.activePortal==='customer'?'customer':'vendor');
 renderVendorHome();
-// Re-arm the kiosk lock across reloads — kioskLocked is persisted, but the
-// lock's tab filtering + unlock chip + PIN gate only exist after
-// applyKioskLock() runs. Without this, a refresh silently unlocked the
-// tablet in the shopper's hands.
-if(ST.kioskLocked)applyKioskLock();
 // Restore the persisted inventory tab on boot so the contextual "+ New X"
 // button label + the visible section match whatever the vendor was last on.
 try{if(typeof setInventoryTab==='function')setInventoryTab(ST.activeInventoryTab||'binders');}catch{}
@@ -28298,6 +28461,10 @@ setInterval(persistST,10000);
 // Storage quota check (#18) — runs once at startup, then every 10 minutes
 checkStorageQuota();
 setInterval(checkStorageQuota,10*60*1000);
+// Heal art on any static-index promo card that was added before its CDN
+// probe finished (or whose probe blipped). Deferred so it doesn't compete
+// with first paint. No-op when there's nothing to heal.
+setTimeout(()=>{try{backfillStaticPromoArt();}catch{}},1500);
 // Permission ask for browser notifications when the user takes their first action
 ['click','keydown','touchstart'].forEach(ev=>document.addEventListener(ev,()=>{maybeRequestNotificationPermission();},{once:true,passive:true}));
 // Cart abandonment ping (#15) — every 60s
@@ -28426,6 +28593,10 @@ setInterval(()=>{
     <div style="display:flex;flex-direction:column;gap:4px"><div class="section-title">Surface</div><select id="f-sg-sur" class="sg-pick"></select></div>
     <div style="display:flex;flex-direction:column;gap:4px"><div class="section-title">Edges</div><select id="f-sg-edg" class="sg-pick"></select></div>
     <div style="display:flex;flex-direction:column;gap:4px"><div class="section-title">Corners</div><select id="f-sg-cor" class="sg-pick"></select></div>
+  </div>
+  <div id="f-cert-row" style="display:none;flex-direction:column;gap:3px">
+    <input id="f-cert" placeholder="Cert number (optional)" autocomplete="off" inputmode="numeric" maxlength="20"/>
+    <div style="font-size:10px;color:var(--color-text-secondary);padding-left:2px;line-height:1.3">Printed on the slab label. Buyers get a "View cert" button that pulls up your card on the grader's site.</div>
   </div>
   <input id="f-price" type="number" placeholder="Ask price ($)" min="0" step="0.25" oninput="autoFillCostFromPrice()"/>
   <input id="f-cost" type="number" placeholder="Your cost ($)" min="0" step="0.25" oninput="this.dataset.userTouched='1'"/>
